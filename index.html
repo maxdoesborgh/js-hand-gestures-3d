@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Hand Particle System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #ui { position: absolute; top: 20px; left: 20px; z-index: 10; color: white; background: rgba(0,0,0,0.5); padding: 15px; border-radius: 8px; }
+        canvas { display: block; }
+        video { position: fixed; bottom: 10px; right: 10px; width: 160px; height: 120px; border: 2px solid #444; border-radius: 4px; z-index: 5; transform: scaleX(-1); }
+        .label { font-size: 12px; margin-bottom: 5px; opacity: 0.8; }
+        input[type="color"] { border: none; width: 40px; height: 40px; cursor: pointer; background: none; }
+        #status { font-weight: bold; color: #0f0; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div class="label">PARTICLE COLOR</div>
+        <input type="color" id="colorPicker" value="#00ffcc">
+        <div id="status">Loading AI Model...</div>
+        <div class="label" style="margin-top:10px;">Gestures: <br>• Open palm: Expand <br>• Fist/Tension: Scale down</div>
+    </div>
+
+    <video id="webcam" autoplay playsinline></video>
+
+    <!-- Load Three.js and MediaPipe -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+        // --- CONFIG ---
+        const PARTICLE_COUNT = 15000;
+        let handLandmarker;
+        let webcamRunning = false;
+        const video = document.getElementById("webcam");
+        const status = document.getElementById("status");
+        const colorPicker = document.getElementById("colorPicker");
+
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 5;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // Particle Geometry
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const originalPositions = new Float32Array(PARTICLE_COUNT * 3);
+        const velocities = new Float32Array(PARTICLE_COUNT * 3);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const x = (Math.random() - 0.5) * 10;
+            const y = (Math.random() - 0.5) * 10;
+            const z = (Math.random() - 0.5) * 10;
+            positions.set([x, y, z], i * 3);
+            originalPositions.set([x, y, z], i * 3);
+            velocities.set([0, 0, 0], i * 3);
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.PointsMaterial({
+            size: 0.02,
+            color: new THREE.Color(colorPicker.value),
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const particleSystem = new THREE.Points(geometry, material);
+        scene.add(particleSystem);
+
+        // Interaction Variables
+        let targetPos = new THREE.Vector3(0, 0, 0);
+        let expansionFactor = 0; // 0 = default, 1 = full open
+        let tensionFactor = 1;   // Scale based on fist
+        
+        // --- MEDIAPIPE INITIALIZATION ---
+        async function initAI() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            status.innerText = "Camera Active";
+            startWebcam();
+        }
+
+        async function startWebcam() {
+            const constraints = { video: true };
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            video.srcObject = stream;
+            video.addEventListener("loadeddata", () => {
+                webcamRunning = true;
+                animate();
+            });
+        }
+
+        // --- LOGIC: GESTURE CALCULATION ---
+        function processHand(results) {
+            if (results.landmarks && results.landmarks.length > 0) {
+                const landmarks = results.landmarks[0];
+                
+                // 1. Position: Use landmark 9 (middle finger MCP) as center
+                // Invert X because webcam is mirrored
+                targetPos.x = -(landmarks[9].x - 0.5) * 10;
+                targetPos.y = -(landmarks[9].y - 0.5) * 10;
+                targetPos.z = -landmarks[9].z * 10;
+
+                // 2. Openness/Expansion: Distance between wrist (0) and middle finger tip (12)
+                const dx = landmarks[0].x - landmarks[12].x;
+                const dy = landmarks[0].y - landmarks[12].y;
+                const distance = Math.sqrt(dx*dx + dy*dy);
+                
+                // Map distance to expansion (roughly 0.1 closed, 0.4 open)
+                expansionFactor = THREE.MathUtils.clamp((distance - 0.15) * 4, 0, 1.5);
+
+                // 3. Tension/Scale: How spread out are the fingers?
+                // Distance between thumb (4) and pinky (20)
+                const tx = landmarks[4].x - landmarks[20].x;
+                const ty = landmarks[4].y - landmarks[20].y;
+                const spread = Math.sqrt(tx*tx + ty*ty);
+                tensionFactor = THREE.MathUtils.clamp(spread * 3, 0.2, 2.0);
+            }
+        }
+
+        // --- ANIMATION LOOP ---
+        let lastVideoTime = -1;
+        function animate() {
+            const startTimeMs = performance.now();
+            
+            // AI Detection
+            if (lastVideoTime !== video.currentTime) {
+                lastVideoTime = video.currentTime;
+                const results = handLandmarker.detectForVideo(video, startTimeMs);
+                processHand(results);
+            }
+
+            // Update Particle Material
+            material.color.set(colorPicker.value);
+
+            // Update Particle Physics
+            const posAttr = geometry.attributes.position;
+            const time = startTimeMs * 0.001;
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                
+                // Organic movement logic
+                const angle = (i / PARTICLE_COUNT) * Math.PI * 2;
+                const orbitRadius = (Math.sin(time + i) * 0.5 + 1.5) * expansionFactor;
+                
+                // Calculate target shape (organic "bloom")
+                const tx = targetPos.x + Math.cos(angle * 2) * orbitRadius * Math.cos(time + i * 0.01);
+                const ty = targetPos.y + Math.sin(angle * 3) * orbitRadius * Math.sin(time * 0.5);
+                const tz = targetPos.z + Math.sin(angle) * orbitRadius;
+
+                // Physics: Smoothly follow hand + tension scaling
+                posAttr.array[i3] += (tx - posAttr.array[i3]) * 0.1 * tensionFactor;
+                posAttr.array[i3+1] += (ty - posAttr.array[i3+1]) * 0.1 * tensionFactor;
+                posAttr.array[i3+2] += (tz - posAttr.array[i3+2]) * 0.1 * tensionFactor;
+                
+                // Add a bit of jitter
+                posAttr.array[i3] += (Math.random() - 0.5) * 0.02;
+                posAttr.array[i3+1] += (Math.random() - 0.5) * 0.02;
+            }
+
+            posAttr.needsUpdate = true;
+            
+            // Subtle camera rotation
+            particleSystem.rotation.y += 0.002;
+
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+
+        // Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        initAI();
+    </script>
+</body>
+</html>
